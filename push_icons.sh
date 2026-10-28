@@ -13,11 +13,12 @@
 #   主题图标目录 /data/bbkcore/theme/icons/ (owner u0_a345, 777,
 #   SELinux u:object_r:vivo_data_file:s0:c512,c768)
 #   桌面按组件类名找图标, 应用信息/分身按包名找, 故每个应用同时推两套命名;
-#   尺寸变体(以主题自带图标缓存实测为准: 高德/微信 blob, 240 档):
+#   尺寸变体(以主题自带图标实测为准, 240 档):
 #     无后缀 240x240 / _1x2 240x480 / _2x1 480x240 / _2x2 480x480
-#     四周透明边距 = 边长 * 21/240 (240 档 21px, 480 档 42px)
-#     圆角半径 = 可见边 * 39/198 (240 档可见 198px, 半径 39px)
-#     之前按 45px 边距生成导致自定义图标视觉上比主题自带小约 25%
+#     主题包/icons目录几何: 62% 可见区 (边距=边长*45/240, 圆角=可见边*37/150)
+#     桌面缓存 db BLOB 几何: 82% 可见区 (边距=边长*21/240, 圆角=可见边*39/198)
+#     桌面会把 icons 目录的图放大到 82% 再入缓存, 两套几何不能混用
+#     之前两处都用 82% 生成, 导致注入主题包后图标视觉上偏大
 #   刷新: 桌面不监听主题目录变化, 重启桌面无效, 单独发 intent.action.theme.changed 也无效;
 #   故直接写 launcher.db 的 location_* 表 icon 字段 (240x240 PNG) 再重启桌面, 不重装任何应用。
 #   缓存更新按 表+行号 精确写入 (行号来自上一步的查询结果), 不再用包名 LIKE。
@@ -85,8 +86,10 @@ adb shell "su -c 'rm -f /data/local/tmp/query_rows.sql'"
 [[ -s "$ROWS_FILE" ]] || { echo "读取桌面数据库失败"; exit 1; }
 echo "共 $(wc -l < "$ROWS_FILE" | tr -d ' ') 行桌面条目"
 
-# 由源图生成 4 个尺寸变体, 几何以主题自带图标缓存实测为准:
-#   边距 = 边长 * 21/240 (四周), 圆角半径 = 可见边 * 39/198
+# 由源图生成图标, 两套几何规范 (均实测自主题包与桌面缓存):
+#   主题包/icons目录: 可见区 62% (240档边距45px, 可见150px, 圆角37px)
+#   db缓存BLOB:       可见区 82% (240档边距21px, 可见198px, 圆角39px)
+#   桌面会把 icons 目录的图放大到 82% 后存入缓存, 两处不能混用。
 #   主题没有 _1x1 变体, 不生成
 gen_variants() {
   local src="$1" base="$2"
@@ -101,18 +104,11 @@ bbox = img.getchannel("A").getbbox()
 if bbox:
     img = img.crop(bbox)
 
-# 边距与圆角按主题自带图标的实测比例: 240 档边距 21, 可见 198, 半径 39
-MARGIN_RATIO = 21 / 240   # 四周透明边距占边长比例
-RADIUS_RATIO = 39 / 198   # 圆角半径占可见边比例
-VARIANTS = [("", 240, 240), ("_1x2", 240, 480),
-            ("_2x1", 480, 240), ("_2x2", 480, 480)]
-
-for suffix, cw, ch in VARIANTS:
-    mx = round(cw * MARGIN_RATIO)
-    my = round(ch * MARGIN_RATIO)
-    ax0, ay0 = mx, my
+def make(cw, ch, margin_ratio, radius_ratio, out):
+    mx = round(cw * margin_ratio)
+    my = round(ch * margin_ratio)
     aw, ah = cw - mx * 2, ch - my * 2
-    radius = round(min(aw, ah) * RADIUS_RATIO)
+    radius = round(min(aw, ah) * radius_ratio)
 
     # 等比缩放到留白区 (允许放大, 保证各尺寸视觉大小一致)
     scale = min(aw / img.width, ah / img.height)
@@ -131,8 +127,19 @@ for suffix, cw, ch in VARIANTS:
     tile.putalpha(ImageChops.multiply(tile.getchannel("A"), mask))
 
     canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-    canvas.paste(tile, (ax0, ay0), tile)
-    canvas.save(f"{base}{suffix}.png")
+    canvas.paste(tile, (mx, my), tile)
+    canvas.save(out)
+
+# 主题包/icons目录规范: 62% 可见区
+THEME_M, THEME_R = 45 / 240, 37 / 150
+# db缓存规范: 82% 可见区
+CACHE_M, CACHE_R = 21 / 240, 39 / 198
+
+for suffix, cw, ch in [("", 240, 240), ("_1x2", 240, 480),
+                       ("_2x1", 480, 240), ("_2x2", 480, 480)]:
+    make(cw, ch, THEME_M, THEME_R, f"{base}{suffix}.png")
+# db 缓存用 240 档 82% 几何, 文件名加 .cache 后缀避免与主题变体混淆
+make(240, 240, CACHE_M, CACHE_R, f"{base}.cache.png")
 PY
 }
 
@@ -181,9 +188,15 @@ adb push "$BUILD"/*.png /data/local/tmp/ >/dev/null
 files=("$BUILD"/*.png)
 APPLY="$BUILD/apply.sh"
 {
-  for f in "${files[@]}"; do echo "cp '/data/local/tmp/${f:t}' '$TARGET/'"; done
+  for f in "${files[@]}"; do
+    [[ "$f" == *.cache.png ]] && continue   # 缓存专用图不进 icons 目录
+    echo "cp '/data/local/tmp/${f:t}' '$TARGET/'"
+  done
   echo "cd '$TARGET'"
-  for f in "${files[@]}"; do echo "chown $OWNER '${f:t}'; chmod 777 '${f:t}'; chcon $SECTX '${f:t}'"; done
+  for f in "${files[@]}"; do
+    [[ "$f" == *.cache.png ]] && continue
+    echo "chown $OWNER '${f:t}'; chmod 777 '${f:t}'; chcon $SECTX '${f:t}'"
+  done
 } > "$APPLY"
 remote_list=""
 for f in "${files[@]}"; do remote_list+="/data/local/tmp/${f:t} "; done
@@ -197,7 +210,7 @@ echo "== 写入桌面图标缓存 =="
 SQL="$BUILD/update.sql"
 echo ".timeout 15000" > "$SQL"
 for ((i=1; i<=${#upd_table[@]}; i++)); do
-  echo "UPDATE ${upd_table[i]} SET icon=readfile('/data/local/tmp/${upd_png[i]}.png') WHERE _id=${upd_id[i]};" >> "$SQL"
+  echo "UPDATE ${upd_table[i]} SET icon=readfile('/data/local/tmp/${upd_png[i]}.cache.png') WHERE _id=${upd_id[i]};" >> "$SQL"
 done
 
 write_cache() {
@@ -243,7 +256,7 @@ while (( attempt <= 3 )); do
     i=1
     while IFS='|' read -r vt vid vlen; do
       [[ -n "$vt" ]] || continue
-      exp=$(stat -f%z "$BUILD/${upd_png[i]}.png")
+      exp=$(stat -f%z "$BUILD/${upd_png[i]}.cache.png")
       [[ "$vlen" == "$exp" ]] || bad+="$vt#$vid "
       (( ++i ))
     done < <(verify_cache)
