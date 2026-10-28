@@ -1,8 +1,8 @@
-#!/data/data/com.termux/files/usr/bin/zsh
+#!/data/data/com.termux/files/usr/bin/bash
 # push_icons_termux.sh — Termux 版: 在手机上直接把 icon/ 里的图片注入当前第三方主题包
 #
 # 用法: ./push_icons_termux.sh [图标文件夹] [主题名]   (默认 脚本同目录/icon; 主题名自动识别)
-# 前提: Termux 内已安装 python / python-pillow / zip / sqlite / zsh,
+# 前提: Termux 内已安装 python / python-pillow / zip / sqlite,
 #       KernelSU 已授权 Termux 的 root, i主题 已应用一个第三方主题
 # 逻辑与电脑版 push_icons.sh 相同, 区别仅是全部操作在本机进行, root 直接用 su。
 #
@@ -11,6 +11,7 @@
 # 注意: 主题更新/重下会覆盖修改, 重跑即可; 首次修改前自动备份原包为 .itz.bak
 
 set -euo pipefail
+shopt -s nullglob   # 通配无匹配时展开为空, 而不是原样保留
 
 # 依赖检测: 缺失时给出安装命令
 _dep_missing=()
@@ -20,7 +21,7 @@ done
 python3 -c 'import PIL' >/dev/null 2>&1 || _dep_missing+=("python-pillow")
 if ((${#_dep_missing[@]} > 0)); then
   echo "依赖未安装: ${_dep_missing[*]}"
-  echo "请运行: pkg install python python-pillow zip sqlite zsh"
+  echo "请运行: pkg install python python-pillow zip sqlite"
   exit 1
 fi
 
@@ -41,14 +42,17 @@ BUILD="$(mktemp -d "${PREFIX:-/data/data/com.termux/files/usr}/tmp/theme_icons.X
 trap 'rm -rf "$BUILD"' EXIT
 
 # 建立 icon/ 图片索引: 小写文件名(去扩展名) -> 文件路径
-typeset -A icon_index
-for src in "$ICON_DIR"/*(N); do
+declare -A icon_index
+for src in "$ICON_DIR"/*; do
   [[ -f "$src" ]] || continue
-  case "${${src:e}:l}" in
+  ext="${src##*.}"
+  case "${ext,,}" in
     png|jpg|jpeg|webp) ;;
     *) continue ;;
   esac
-  icon_index[${${${src:t}:r}:l}]="$src"
+  name="${src##*/}"
+  name_noext="${name%.*}"
+  icon_index["${name_noext,,}"]="$src"
 done
 (( ${#icon_index[@]} > 0 )) || { echo "图标文件夹里没有可用图片: $ICON_DIR"; exit 1; }
 
@@ -64,10 +68,11 @@ fi
   || { echo "未识别到第三方主题, 请先在 i主题 下载并应用一个第三方主题"; exit 1; }
 
 itz_remote=$(su -c "find $THEME_DIR/.dwd -name '*.itz'" | tr -d '\r' \
-  | grep -v '/F/' | grep -v '/U/' | grep "/${theme_name}.itz$" | head -1)
+  | grep -v '/F/' | grep -v '/U/' | { grep "/${theme_name}.itz$" || true; } | head -1)
 [[ -n "$itz_remote" ]] || {
   echo "找不到主题包文件: ${theme_name}.itz, 设备上的主题包有:"
   su -c "find $THEME_DIR/.dwd -name '*.itz'" | tr -d '\r' | grep -v '/F/' | grep -v '/U/'
+  echo "提示: 请先在 i主题 应用设备上存在的第三方主题, 或用第二个参数手动指定主题名"
   exit 1
 }
 echo "当前主题: $theme_name ($itz_remote)"
@@ -81,7 +86,10 @@ QSQL="$BUILD/query.sql"
     echo "SELECT '$t',_id,title,intent FROM $t WHERE title IS NOT NULL AND title<>'' AND intent LIKE '%/%';"
   done
 } > "$QSQL"
-su -c "sqlite3 $DB < '$QSQL'" | tr -d '\r' > "$ROWS_FILE"
+# Termux 会话里 su 直读 /data/user_de 可能因 SELinux 类别被拦, 先拷到本地再查
+su -c "cat '$DB'" > "$BUILD/launcher.db" \
+  || { echo "无法读取桌面数据库, 检查 root 权限"; exit 1; }
+sqlite3 "$BUILD/launcher.db" < "$QSQL" | tr -d '\r' | sed 's/"//g' > "$ROWS_FILE"
 [[ -s "$ROWS_FILE" ]] || { echo "读取桌面数据库失败"; exit 1; }
 echo "共 $(wc -l < "$ROWS_FILE" | tr -d ' ') 行桌面条目"
 
@@ -134,11 +142,11 @@ PY
 
 # 逐行处理桌面条目: 标题 -> 图片, 组件类名 -> 主题包内文件名
 ok=0
-typeset -A generated    # 已生成变体的类名, 避免重复生成
-typeset -A matched_icon # 已匹配上的图片索引 key, 用于最后统计未用到的图
+generated_list=""     # 已生成变体的类名 (空格分隔), 避免重复生成
+matched_list=""       # 已匹配上的图片名 (空格分隔), 用于最后统计未用到的图
 mkdir -p "$BUILD/staging/icons"
 while IFS=$'\t' read -r tbl id title intent; do
-  key="${title:l}"
+  key="${title,,}"
   src="${icon_index[$key]:-}"
   [[ -n "$src" ]] || continue   # 该标题没有同名图片, 静默略过 (最后统一报未用到的图)
 
@@ -149,20 +157,21 @@ while IFS=$'\t' read -r tbl id title intent; do
     cls="$pkg$cls"
   fi
 
-  if [[ -z "${generated[$cls]:-}" ]]; then
+  if [[ " $generated_list " != *" $cls "* ]]; then
     echo "[处理] $title -> $cls"
     gen_variants "$src" "$BUILD/staging/icons/$cls"
     [[ "$pkg" != "$cls" ]] && gen_variants "$src" "$BUILD/staging/icons/$pkg"
-    generated[$cls]=1
-    matched_icon[$key]=1
+    generated_list+=" $cls"
+    matched_list+=" $key"
+    ((ok++)) || true
   fi
 done < "$ROWS_FILE"
-ok=${#generated[@]}
 
 # 报告本地有图但没匹配到任何桌面条目的
-for k v in ${(kv)icon_index}; do
-  if [[ -z "${matched_icon[$k]:-}" ]]; then
-    echo "[跳过] ${v:t:r} —— 桌面上没有叫这个名字的应用"
+for k in "${!icon_index[@]}"; do
+  if [[ " $matched_list " != *" $k "* ]]; then
+    v="${icon_index[$k]}"
+    echo "[跳过] ${v##*/} —— 桌面上没有叫这个名字的应用"
   fi
 done
 
