@@ -8,6 +8,10 @@ OriginOS 的桌面图标由第三方主题提供，主题里没有的应用只�
 
 全程不修改应用本身，不重装应用，不丢数据。
 
+## 效果图
+
+![桌面效果图](docs/screenshot.jpg)
+
 ## 验证环境
 
 - 机型：vivo（Qualcomm 平台），Android 14，内核 6.1（android14-6.1 GKI）
