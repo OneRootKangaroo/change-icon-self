@@ -12,18 +12,28 @@
 
 ## 前提
 
-1. 手机已 root（如 KernelSU），并授权 shell
-2. 手机连电脑，已开启 USB 调试
-3. 在 i主题 下载并应用**任意一个第三方主题**（系统默认主题不行）
+1. 手机已 root（如 KernelSU）
+2. 在 i主题 下载并应用**任意一个第三方主题**（系统默认主题不行）
 
-## 用法
+两种方式二选一：电脑跑（push_icons.sh）或手机上直接跑（push_icons_termux.sh，无需电脑）。
 
-1. 首次使用运行 `install.sh`（自动安装 adb / python3 / Pillow）
-2. 图片放到 icon 文件夹，按应用名命名：`QQ.jpg`、`微信.png`（正方形照片即可，无需透明背景）
-3. 运行 `push_icons.sh`
-4. 按提示打开 i主题 → 我的 → 主题 → 重新应用该主题，图标即生效
+## 用法一：电脑（macOS）
 
-脚本会自动识别当前应用的主题，无需任何配置。之后增改图标，重复第 2-4 步即可。
+1. 手机连电脑，开启 USB 调试，KernelSU 授权 shell
+2. 首次使用运行 `install.sh`（自动安装 adb / python3 / Pillow）
+3. 图片放到 icon 文件夹，按应用名命名：`QQ.jpg`、`微信.png`（正方形照片即可，无需透明背景）
+4. 运行 `push_icons.sh`
+5. 按提示打开 i主题 → 我的 → 主题 → 重新应用该主题，图标即生效
+
+## 用法二：手机（Termux，无需电脑）
+
+1. Termux 里安装依赖：`pkg install python python-pillow zip sqlite zsh`
+2. 把本仓库下载到手机（`pkg install git` 后 `git clone`，或网页下载 zip 解压）
+3. 图片放到仓库的 icon 文件夹（可用 MT 管理器等把照片复制进去）
+4. 运行 `./push_icons_termux.sh`，首次 KernelSU 弹窗请允许 Termux 使用 root
+5. 按提示打开 i主题 → 我的 → 主题 → 重新应用该主题，图标即生效
+
+脚本会自动识别当前应用的主题，无需任何配置。之后增改图标，重复「放图片 → 跑脚本 → 重新应用主题」即可。
 
 <br />
 
