@@ -1,0 +1,9 @@
+.DS_Store
+
+# 个人图标（照片）不上传, 保留目录结构
+icon/*
+!icon/.gitkeep
+!icon/README.md
+
+# 旧版映射表（已弃用, 脚本从桌面数据库直接读取标题与组件）
+icon_map.tsv
