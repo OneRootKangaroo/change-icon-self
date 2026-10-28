@@ -1,27 +1,27 @@
 #!/bin/zsh
-# push_icons.sh — 把「自定义图标」文件夹里的 <应用名称>.png 批量应用到 vivo 主题图标
+# push_icons.sh — 把「icon」文件夹里的 <应用名称>.png 注入当前第三方主题包
 #
-# 用法: ./push_icons.sh [图标文件夹]        (默认 脚本同目录/icon)
+# 用法: ./push_icons.sh [图标文件夹] [主题名]   (默认 脚本同目录/icon; 主题名自动识别)
 # 格式: png / jpg / jpeg / webp 均可, 内部统一转成 PNG 变体, 不改动源文件
-# 前提: 手机已连 adb、KernelSU 已授权 shell、i主题 已应用目标主题
+# 前提: 手机已连 adb、KernelSU 已授权 shell、i主题 已应用一个第三方主题
 #
-# 匹配方式 (不再依赖 icon_map.tsv):
-#   从桌面数据库 launcher.db 直接读出「应用标题 + 组件名」,
-#   用标题去 icon/ 里找同名图片 (大小写不敏感), 找到即处理。
+# 流程:
+#   1. 从桌面数据库 launcher.db 读出「应用标题 + 组件名」, 用标题去 icon/ 找同名图片
+#   2. 生成主题规范的图标变体, 注入当前主题包 .itz (zip) 的 icons/ 目录
+#   3. 替换设备上的主题包, 用户在 i主题 重新应用一次主题即生效
 #
-# 原理(2026-10-24 豆包实测):
-#   主题图标目录 /data/bbkcore/theme/icons/ (owner u0_a345, 777,
-#   SELinux u:object_r:vivo_data_file:s0:c512,c768)
-#   桌面按组件类名找图标, 应用信息/分身按包名找, 故每个应用同时推两套命名;
-#   尺寸变体(以主题自带图标实测为准, 240 档):
-#     无后缀 240x240 / _1x2 240x480 / _2x1 480x240 / _2x2 480x480
-#     主题包/icons目录几何: 62% 可见区 (边距=边长*45/240, 圆角=可见边*37/150)
-#     桌面缓存 db BLOB 几何: 82% 可见区 (边距=边长*21/240, 圆角=可见边*39/198)
-#     桌面会把 icons 目录的图放大到 82% 再入缓存, 两套几何不能混用
-#     之前两处都用 82% 生成, 导致注入主题包后图标视觉上偏大
-#   刷新: 桌面不监听主题目录变化, 重启桌面无效, 单独发 intent.action.theme.changed 也无效;
-#   故直接写 launcher.db 的 location_* 表 icon 字段 (240x240 PNG) 再重启桌面, 不重装任何应用。
-#   缓存更新按 表+行号 精确写入 (行号来自上一步的查询结果), 不再用包名 LIKE。
+# 为什么走主题包而不是写桌面缓存 (2026-10-29 实测):
+#   注入主题包后图标成为主题资源, 变形器调节图标大小不会回退,
+#   电话/抖音/小红书等会被系统管线回退的顽固应用也能根治;
+#   而写 launcher.db 缓存的做法会被回退、且变形器一调就还原, 已废弃。
+#
+# 图标规范 (实测自主题包原始图标):
+#   无后缀 240x240 / _1x2 240x480 / _2x1 480x240 / _2x2 480x480 (无 _1x1)
+#   可见区 62%: 四周透明边距 = 边长 * 45/240, 圆角半径 = 可见边 * 37/150
+#   文件名: 桌面按组件类名找图标, 应用信息按包名找, 每个应用同时注入两套命名
+#
+# 注意: 主题从商店更新/重新下载会覆盖修改, 重跑本脚本即可;
+#   首次修改前会在设备上备份原包为 <主题名>.itz.bak, 需要还原时改回即可。
 
 set -euo pipefail
 
@@ -29,6 +29,7 @@ set -euo pipefail
 _dep_missing=()
 command -v adb >/dev/null 2>&1 || _dep_missing+=("adb")
 command -v python3 >/dev/null 2>&1 || _dep_missing+=("python3")
+command -v zip >/dev/null 2>&1 || _dep_missing+=("zip")
 python3 -c 'import PIL' >/dev/null 2>&1 || _dep_missing+=("Pillow")
 if ((${#_dep_missing[@]} > 0)); then
   echo "依赖未安装，无法运行本脚本，请运行install.sh后再来"
@@ -38,9 +39,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ICON_DIR="${1:-$SCRIPT_DIR/icon}"
-TARGET="/data/bbkcore/theme/icons"
-OWNER="u0_a345:u0_a345"
-SECTX="u:object_r:vivo_data_file:s0:c512,c768"
+THEME_ARG="${2:-}"
+THEME_DIR="/data/bbkcore/theme"
 DB="/data/user_de/0/com.bbk.launcher2/databases/launcher.db"
 tables=(location_jan location_jan_drawer location_feb location_feb_drawer location_simple)
 
@@ -48,10 +48,6 @@ tables=(location_jan location_jan_drawer location_feb location_feb_drawer locati
 
 echo "== 检查设备与 root =="
 adb shell "su -c 'id'" | grep -q 'uid=0' || { echo "ADB root 不可用, 检查 KernelSU 是否授权 shell"; exit 1; }
-
-# 换主题会清空/删除该目录, 不存在时按实测的 owner/权限/SELinux 重建
-adb shell "su -c 'mkdir -p $TARGET && chown $OWNER $TARGET && chmod 777 $TARGET && chcon $SECTX $TARGET'" \
-  || { echo "无法准备目标目录 $TARGET"; exit 1; }
 
 BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
@@ -68,10 +64,28 @@ for src in "$ICON_DIR"/*(N); do
 done
 (( ${#icon_index[@]} > 0 )) || { echo "图标文件夹里没有可用图片: $ICON_DIR"; exit 1; }
 
+echo "== 识别当前主题包 =="
+# 当前主题名在 description.xml 里; 主题包是 .dwd 下的 .itz (排除 F/字体 U/解锁样式)
+if [[ -n "$THEME_ARG" ]]; then
+  theme_name="$THEME_ARG"
+else
+  theme_name=$(adb shell "su -c 'cat $THEME_DIR/description.xml'" | tr -d '\r' \
+    | sed -n 's/.*<title[^>]*><!\[CDATA\[\(.*\)\]\]><\/title>.*/\1/p' | head -1)
+fi
+[[ -n "$theme_name" && "$theme_name" != "默认" ]] \
+  || { echo "未识别到第三方主题, 请先在 i主题 下载并应用一个第三方主题"; exit 1; }
+
+itz_remote=$(adb shell "su -c 'find $THEME_DIR/.dwd -name \"*.itz\"'" | tr -d '\r' \
+  | grep -v '/F/' | grep -v '/U/' | grep "/${theme_name}.itz$" | head -1)
+[[ -n "$itz_remote" ]] || {
+  echo "找不到主题包文件: ${theme_name}.itz, 设备上的主题包有:"
+  adb shell "su -c 'find $THEME_DIR/.dwd -name \"*.itz\"'" | tr -d '\r' | grep -v '/F/' | grep -v '/U/'
+  exit 1
+}
+echo "当前主题: $theme_name ($itz_remote)"
+
 echo "== 从桌面数据库读取应用标题与组件 =="
-# 直接从库中取 表名/行号/标题/intent, 后续缓存按行号精确回写
 ROWS_FILE="$BUILD/rows.tsv"
-# 多层 shell 嵌套下引号容易被吃掉, 改成推 SQL 文件用重定向执行
 QSQL="$BUILD/query.sql"
 {
   echo ".mode tabs"
@@ -82,15 +96,10 @@ QSQL="$BUILD/query.sql"
 adb push "$QSQL" /data/local/tmp/query_rows.sql >/dev/null
 adb shell "su -c 'sqlite3 $DB < /data/local/tmp/query_rows.sql'" | tr -d '\r' > "$ROWS_FILE"
 adb shell "su -c 'rm -f /data/local/tmp/query_rows.sql'"
-
 [[ -s "$ROWS_FILE" ]] || { echo "读取桌面数据库失败"; exit 1; }
 echo "共 $(wc -l < "$ROWS_FILE" | tr -d ' ') 行桌面条目"
 
-# 由源图生成图标, 两套几何规范 (均实测自主题包与桌面缓存):
-#   主题包/icons目录: 可见区 62% (240档边距45px, 可见150px, 圆角37px)
-#   db缓存BLOB:       可见区 82% (240档边距21px, 可见198px, 圆角39px)
-#   桌面会把 icons 目录的图放大到 82% 后存入缓存, 两处不能混用。
-#   主题没有 _1x1 变体, 不生成
+# 由源图生成 4 个尺寸变体, 几何与主题包原始图标一致: 62% 可见区
 gen_variants() {
   local src="$1" base="$2"
   python3 - "$src" "$base" <<'PY'
@@ -104,11 +113,16 @@ bbox = img.getchannel("A").getbbox()
 if bbox:
     img = img.crop(bbox)
 
-def make(cw, ch, margin_ratio, radius_ratio, out):
-    mx = round(cw * margin_ratio)
-    my = round(ch * margin_ratio)
+# 主题包规范: 240 档边距 45px, 可见 150px, 圆角 37px
+MARGIN_RATIO = 45 / 240
+RADIUS_RATIO = 37 / 150
+
+for suffix, cw, ch in [("", 240, 240), ("_1x2", 240, 480),
+                       ("_2x1", 480, 240), ("_2x2", 480, 480)]:
+    mx = round(cw * MARGIN_RATIO)
+    my = round(ch * MARGIN_RATIO)
     aw, ah = cw - mx * 2, ch - my * 2
-    radius = round(min(aw, ah) * radius_ratio)
+    radius = round(min(aw, ah) * RADIUS_RATIO)
 
     # 等比缩放到留白区 (允许放大, 保证各尺寸视觉大小一致)
     scale = min(aw / img.width, ah / img.height)
@@ -128,26 +142,15 @@ def make(cw, ch, margin_ratio, radius_ratio, out):
 
     canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
     canvas.paste(tile, (mx, my), tile)
-    canvas.save(out)
-
-# 主题包/icons目录规范: 62% 可见区
-THEME_M, THEME_R = 45 / 240, 37 / 150
-# db缓存规范: 82% 可见区
-CACHE_M, CACHE_R = 21 / 240, 39 / 198
-
-for suffix, cw, ch in [("", 240, 240), ("_1x2", 240, 480),
-                       ("_2x1", 480, 240), ("_2x2", 480, 480)]:
-    make(cw, ch, THEME_M, THEME_R, f"{base}{suffix}.png")
-# db 缓存用 240 档 82% 几何, 文件名加 .cache 后缀避免与主题变体混淆
-make(240, 240, CACHE_M, CACHE_R, f"{base}.cache.png")
+    canvas.save(f"{base}{suffix}.png")
 PY
 }
 
-# 逐行处理桌面条目: 标题 -> 图片, 组件类名 -> 主题文件名, 行号 -> 缓存回写
+# 逐行处理桌面条目: 标题 -> 图片, 组件类名 -> 主题包内文件名
 ok=0
 typeset -A generated    # 已生成变体的类名, 避免重复生成
 typeset -A matched_icon # 已匹配上的图片索引 key, 用于最后统计未用到的图
-typeset -a upd_table upd_id upd_png
+mkdir -p "$BUILD/staging/icons"
 while IFS=$'\t' read -r tbl id title intent; do
   key="${title:l}"
   src="${icon_index[$key]:-}"
@@ -162,12 +165,11 @@ while IFS=$'\t' read -r tbl id title intent; do
 
   if [[ -z "${generated[$cls]:-}" ]]; then
     echo "[处理] $title -> $cls"
-    gen_variants "$src" "$BUILD/$cls"
-    [[ "$pkg" != "$cls" ]] && gen_variants "$src" "$BUILD/$pkg"
+    gen_variants "$src" "$BUILD/staging/icons/$cls"
+    [[ "$pkg" != "$cls" ]] && gen_variants "$src" "$BUILD/staging/icons/$pkg"
     generated[$cls]=1
     matched_icon[$key]=1
   fi
-  upd_table+=("$tbl"); upd_id+=("$id"); upd_png+=("$cls")
 done < "$ROWS_FILE"
 ok=${#generated[@]}
 
@@ -178,98 +180,23 @@ for k v in ${(kv)icon_index}; do
   fi
 done
 
-(( ok > 0 )) || { echo "没有可推送的图标"; exit 0; }
+(( ok > 0 )) || { echo "没有可注入的图标"; exit 0; }
 
-echo "== 推送 $ok 个应用的图标到手机 =="
-adb push "$BUILD"/*.png /data/local/tmp/ >/dev/null
+echo "== 拉取主题包并注入 $ok 个应用的图标 =="
+# adb shell 身份无权读主题目录, 经 root 用 cat 拉取
+adb shell "su -c 'cat \"$itz_remote\"'" > "$BUILD/theme.itz"
+# 组件名里可能含 $ (如 YouTube 的 Shell$HomeActivity), 走 zip 文件操作不经 shell 展开, 天然安全
+( cd "$BUILD/staging" && zip -q -r "$BUILD/theme.itz" icons )
+# 校验: 包内不允许出现 0 字节的 PNG (曾因此导致 YouTube 图标破损)
+bad=$(unzip -l "$BUILD/theme.itz" | awk '$1==0 && $4 ~ /png$/ {print $4}')
+[[ -z "$bad" ]] || { echo "注入后包内出现空文件: $bad"; exit 1; }
 
-# 逐文件: 拷贝 + owner + 权限 + SELinux 上下文
-# 组件名里可能出现 $ (如 YouTube 的 Shell$HomeActivity), 必须整体加引号, 故生成设备端脚本执行
-files=("$BUILD"/*.png)
-APPLY="$BUILD/apply.sh"
-{
-  for f in "${files[@]}"; do
-    [[ "$f" == *.cache.png ]] && continue   # 缓存专用图不进 icons 目录
-    echo "cp '/data/local/tmp/${f:t}' '$TARGET/'"
-  done
-  echo "cd '$TARGET'"
-  for f in "${files[@]}"; do
-    [[ "$f" == *.cache.png ]] && continue
-    echo "chown $OWNER '${f:t}'; chmod 777 '${f:t}'; chcon $SECTX '${f:t}'"
-  done
-} > "$APPLY"
-remote_list=""
-for f in "${files[@]}"; do remote_list+="'/data/local/tmp/${f:t}' "; done
-adb push "$APPLY" /data/local/tmp/apply_icons.sh >/dev/null
-adb shell "su -c 'sh /data/local/tmp/apply_icons.sh'"
+echo "== 替换设备上的主题包 =="
+# 首次修改前备份原包, 之后不覆盖备份
+adb shell "su -c '[ -f \"$itz_remote.bak\" ] || cp \"$itz_remote\" \"$itz_remote.bak\"'"
+adb push "$BUILD/theme.itz" /data/local/tmp/theme_new.itz >/dev/null
+adb shell "su -c 'cat /data/local/tmp/theme_new.itz > \"$itz_remote\" && chown u0_a345:u0_a345 \"$itz_remote\" && chmod 777 \"$itz_remote\" && chcon u:object_r:vivo_data_file:s0:c512,c768 \"$itz_remote\" && rm /data/local/tmp/theme_new.itz'"
 
-echo "== 写入桌面图标缓存 =="
-# 桌面把图标位图缓存在 launcher.db 的 location_* 表 icon 字段 (240x240 PNG)。
-# 只重启桌面不会重读主题目录; 应用主题的 intent.action.theme.changed 广播单独发也无效。
-# 因此直接把生成好的 240 档 PNG 写进缓存, 再重启桌面。按 表+行号 精确写入。
-SQL="$BUILD/update.sql"
-echo ".timeout 15000" > "$SQL"
-for ((i=1; i<=${#upd_table[@]}; i++)); do
-  echo "UPDATE ${upd_table[i]} SET icon=readfile('/data/local/tmp/${upd_png[i]}.cache.png') WHERE _id=${upd_id[i]};" >> "$SQL"
-done
-
-write_cache() {
-  # force-stop 后系统会立刻拉起桌面并持锁, 必须确认进程死透再写库
-  adb shell "su -c 'am force-stop com.bbk.launcher2; for i in \$(seq 1 40); do pidof com.bbk.launcher2 >/dev/null || break; sleep 0.25; done'"
-  adb shell "su -c 'cp $DB /data/local/tmp/launcher.db.bak'"
-  adb push "$SQL" /data/local/tmp/update_icons.sql >/dev/null
-  # sqlite3 遇到锁会打印错误但继续执行且返回 0, 必须抓输出判断
-  local out
-  out=$(adb shell "su -c 'sqlite3 $DB < /data/local/tmp/update_icons.sql'" 2>&1) || true
-  if print -r -- "$out" | grep -qiE 'locked|error'; then
-    echo "数据库被占用, 本次写入失败"
-    return 1
-  fi
-  # 清掉 root 产生的日志文件并恢复 owner/权限, 否则桌面可能打不开库
-  adb shell "su -c 'rm -f $DB-journal $DB-wal $DB-shm; chown u0_a108:u0_a108 $DB; chmod 660 $DB'"
-  # 写库期间系统可能已自动把桌面拉起来并缓存了旧图, 再停一次确保它重启后读新缓存
-  adb shell "su -c 'am force-stop com.bbk.launcher2; sleep 1; am force-stop com.bbk.launcher2'"
-  adb shell "su -c 'am start -n com.bbk.launcher2/.Launcher'" >/dev/null 2>&1 || true
-}
-
-# 回读校验: 桌面被自动拉起时可能把内存里的旧缓存回写覆盖我们的写入,
-# 逐行对比 库中 icon 长度 == 本地 240 档 PNG 字节数
-verify_cache() {
-  VSQL="$BUILD/verify.sql"
-  : > "$VSQL"
-  for ((i=1; i<=${#upd_table[@]}; i++)); do
-    echo "SELECT '${upd_table[i]}|${upd_id[i]}|' || length(icon) FROM ${upd_table[i]} WHERE _id=${upd_id[i]};" >> "$VSQL"
-  done
-  adb push "$VSQL" /data/local/tmp/verify.sql >/dev/null
-  adb shell "su -c 'sqlite3 $DB < /data/local/tmp/verify.sql'" | tr -d '\r' || true
-}
-
-# verify.sql 的输出顺序与 upd_* 数组一致, 逐行对位比较, 不用关联数组
-# (zsh 下标里引号是字面量, 带引号写入/变量读取会落在不同键空间)
-attempt=1
-verified=0
-while (( attempt <= 3 )); do
-  (( attempt > 1 )) && echo "缓存写入未生效, 第 $attempt 次重试..."
-  if write_cache; then
-    sleep 2
-    bad=""
-    i=1
-    while IFS='|' read -r vt vid vlen; do
-      [[ -n "$vt" ]] || continue
-      exp=$(stat -f%z "$BUILD/${upd_png[i]}.cache.png")
-      [[ "$vlen" == "$exp" ]] || bad+="$vt#$vid "
-      (( ++i ))
-    done < <(verify_cache)
-    if [[ -z "$bad" ]]; then
-      verified=1
-      break
-    fi
-  fi
-  (( attempt++ ))
-done
-(( verified )) || echo "警告: 以下缓存行多次写入仍未生效, 请重跑脚本: $bad"
-
-adb shell "su -c 'rm -f $remote_list /data/local/tmp/verify.sql /data/local/tmp/update_icons.sql'"
-
-echo "完成: 成功 $ok 个应用 (写入 ${#upd_table[@]} 行缓存)。解锁手机查看效果。"
-echo "缓存库备份: /data/local/tmp/launcher.db.bak"
+echo "完成: 已向主题「$theme_name」注入 $ok 个应用的图标。"
+echo "原包备份: $itz_remote.bak"
+echo "最后一步: 打开 i主题 → 我的 → 主题 → 重新应用「$theme_name」, 图标即生效。"
