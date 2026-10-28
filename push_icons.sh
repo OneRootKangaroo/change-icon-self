@@ -24,6 +24,17 @@
 
 set -euo pipefail
 
+# 依赖检测: 缺失时提示先运行 install.sh
+_dep_missing=()
+command -v adb >/dev/null 2>&1 || _dep_missing+=("adb")
+command -v python3 >/dev/null 2>&1 || _dep_missing+=("python3")
+python3 -c 'import PIL' >/dev/null 2>&1 || _dep_missing+=("Pillow")
+if ((${#_dep_missing[@]} > 0)); then
+  echo "依赖未安装，无法运行本脚本，请运行install.sh后再来"
+  echo "缺少: ${_dep_missing[*]}"
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ICON_DIR="${1:-$SCRIPT_DIR/icon}"
 TARGET="/data/bbkcore/theme/icons"
