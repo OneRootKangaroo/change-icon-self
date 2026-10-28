@@ -200,17 +200,56 @@ for ((i=1; i<=${#upd_table[@]}; i++)); do
   echo "UPDATE ${upd_table[i]} SET icon=readfile('/data/local/tmp/${upd_png[i]}.png') WHERE _id=${upd_id[i]};" >> "$SQL"
 done
 
-adb shell "su -c 'am force-stop com.bbk.launcher2; sleep 1'"
-adb shell "su -c 'cp $DB /data/local/tmp/launcher.db.bak'"
-adb push "$SQL" /data/local/tmp/update_icons.sql >/dev/null
-adb shell "su -c 'sqlite3 $DB < /data/local/tmp/update_icons.sql'"
-# 清掉 root 产生的日志文件并恢复 owner/权限, 否则桌面可能打不开库
-adb shell "su -c 'rm -f $DB-journal $DB-wal $DB-shm; chown u0_a108:u0_a108 $DB; chmod 660 $DB'"
-# 写库期间系统可能已自动把桌面拉起来并缓存了旧图, 再停一次确保它重启后读新缓存
-adb shell "su -c 'am force-stop com.bbk.launcher2; sleep 1; am force-stop com.bbk.launcher2'"
-adb shell "su -c 'am start -n com.bbk.launcher2/.Launcher'" >/dev/null 2>&1 || true
+write_cache() {
+  # force-stop 后系统会立刻拉起桌面并持锁, 必须确认进程死透再写库
+  adb shell "su -c 'am force-stop com.bbk.launcher2; for i in \$(seq 1 40); do pidof com.bbk.launcher2 >/dev/null || break; sleep 0.25; done'"
+  adb shell "su -c 'cp $DB /data/local/tmp/launcher.db.bak'"
+  adb push "$SQL" /data/local/tmp/update_icons.sql >/dev/null
+  adb shell "su -c 'sqlite3 $DB < /data/local/tmp/update_icons.sql'"
+  # 清掉 root 产生的日志文件并恢复 owner/权限, 否则桌面可能打不开库
+  adb shell "su -c 'rm -f $DB-journal $DB-wal $DB-shm; chown u0_a108:u0_a108 $DB; chmod 660 $DB'"
+  # 写库期间系统可能已自动把桌面拉起来并缓存了旧图, 再停一次确保它重启后读新缓存
+  adb shell "su -c 'am force-stop com.bbk.launcher2; sleep 1; am force-stop com.bbk.launcher2'"
+  adb shell "su -c 'am start -n com.bbk.launcher2/.Launcher'" >/dev/null 2>&1 || true
+}
 
-adb shell "su -c 'rm -f $remote_list'"
+# 回读校验: 桌面被自动拉起时可能把内存里的旧缓存回写覆盖我们的写入,
+# 逐行对比 库中 icon 长度 == 本地 240 档 PNG 字节数
+verify_cache() {
+  VSQL="$BUILD/verify.sql"
+  : > "$VSQL"
+  for ((i=1; i<=${#upd_table[@]}; i++)); do
+    echo "SELECT '${upd_table[i]}|${upd_id[i]}|' || length(icon) FROM ${upd_table[i]} WHERE _id=${upd_id[i]};" >> "$VSQL"
+  done
+  adb push "$VSQL" /data/local/tmp/verify.sql >/dev/null
+  adb shell "su -c 'sqlite3 $DB < /data/local/tmp/verify.sql'" | tr -d '\r' || true
+}
+
+# verify.sql 的输出顺序与 upd_* 数组一致, 逐行对位比较, 不用关联数组
+# (zsh 下标里引号是字面量, 带引号写入/变量读取会落在不同键空间)
+attempt=1
+verified=0
+while (( attempt <= 3 )); do
+  (( attempt > 1 )) && echo "缓存被桌面回写覆盖, 第 $attempt 次重试..."
+  write_cache
+  sleep 2
+  bad=""
+  i=1
+  while IFS='|' read -r vt vid vlen; do
+    [[ -n "$vt" ]] || continue
+    exp=$(stat -f%z "$BUILD/${upd_png[i]}.png")
+    [[ "$vlen" == "$exp" ]] || bad+="$vt#$vid "
+    (( ++i ))
+  done < <(verify_cache)
+  if [[ -z "$bad" ]]; then
+    verified=1
+    break
+  fi
+  (( attempt++ ))
+done
+(( verified )) || echo "警告: 以下缓存行多次写入仍未生效, 请重跑脚本: $bad"
+
+adb shell "su -c 'rm -f $remote_list /data/local/tmp/verify.sql /data/local/tmp/update_icons.sql'"
 
 echo "完成: 成功 $ok 个应用 (写入 ${#upd_table[@]} 行缓存)。解锁手机查看效果。"
 echo "缓存库备份: /data/local/tmp/launcher.db.bak"
