@@ -199,7 +199,7 @@ APPLY="$BUILD/apply.sh"
   done
 } > "$APPLY"
 remote_list=""
-for f in "${files[@]}"; do remote_list+="/data/local/tmp/${f:t} "; done
+for f in "${files[@]}"; do remote_list+="'/data/local/tmp/${f:t}' "; done
 adb push "$APPLY" /data/local/tmp/apply_icons.sh >/dev/null
 adb shell "su -c 'sh /data/local/tmp/apply_icons.sh'"
 
