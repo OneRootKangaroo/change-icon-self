@@ -205,7 +205,13 @@ write_cache() {
   adb shell "su -c 'am force-stop com.bbk.launcher2; for i in \$(seq 1 40); do pidof com.bbk.launcher2 >/dev/null || break; sleep 0.25; done'"
   adb shell "su -c 'cp $DB /data/local/tmp/launcher.db.bak'"
   adb push "$SQL" /data/local/tmp/update_icons.sql >/dev/null
-  adb shell "su -c 'sqlite3 $DB < /data/local/tmp/update_icons.sql'"
+  # sqlite3 遇到锁会打印错误但继续执行且返回 0, 必须抓输出判断
+  local out
+  out=$(adb shell "su -c 'sqlite3 $DB < /data/local/tmp/update_icons.sql'" 2>&1) || true
+  if print -r -- "$out" | grep -qiE 'locked|error'; then
+    echo "数据库被占用, 本次写入失败"
+    return 1
+  fi
   # 清掉 root 产生的日志文件并恢复 owner/权限, 否则桌面可能打不开库
   adb shell "su -c 'rm -f $DB-journal $DB-wal $DB-shm; chown u0_a108:u0_a108 $DB; chmod 660 $DB'"
   # 写库期间系统可能已自动把桌面拉起来并缓存了旧图, 再停一次确保它重启后读新缓存
@@ -230,20 +236,21 @@ verify_cache() {
 attempt=1
 verified=0
 while (( attempt <= 3 )); do
-  (( attempt > 1 )) && echo "缓存被桌面回写覆盖, 第 $attempt 次重试..."
-  write_cache
-  sleep 2
-  bad=""
-  i=1
-  while IFS='|' read -r vt vid vlen; do
-    [[ -n "$vt" ]] || continue
-    exp=$(stat -f%z "$BUILD/${upd_png[i]}.png")
-    [[ "$vlen" == "$exp" ]] || bad+="$vt#$vid "
-    (( ++i ))
-  done < <(verify_cache)
-  if [[ -z "$bad" ]]; then
-    verified=1
-    break
+  (( attempt > 1 )) && echo "缓存写入未生效, 第 $attempt 次重试..."
+  if write_cache; then
+    sleep 2
+    bad=""
+    i=1
+    while IFS='|' read -r vt vid vlen; do
+      [[ -n "$vt" ]] || continue
+      exp=$(stat -f%z "$BUILD/${upd_png[i]}.png")
+      [[ "$vlen" == "$exp" ]] || bad+="$vt#$vid "
+      (( ++i ))
+    done < <(verify_cache)
+    if [[ -z "$bad" ]]; then
+      verified=1
+      break
+    fi
   fi
   (( attempt++ ))
 done
